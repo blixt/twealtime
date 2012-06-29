@@ -34,19 +34,19 @@ type Tweet struct {
 }
 
 type UrlEntity struct {
-	Url          string
-	Expanded_url string
-	Indices      []int
+	Url         string
+	ExpandedUrl string `json:"expanded_url"`
+	Indices     []int
 }
 
 type User struct {
-	Id                uint64
-	Name              string
-	Screen_name       string
-	Profile_image_url string
-	Followers_count   int
-	Friends_count     int
-	Listed_count      int
+	Id              uint64
+	Name            string
+	ScreenName      string `json:"screen_name"`
+	ProfileImageUrl string `json:"profile_image_url"`
+	FollowersCount  int    `json:"followers_count"`
+	FriendsCount    int    `json:"friends_count"`
+	ListedCount     int    `json:"listed_count"`
 }
 
 const (

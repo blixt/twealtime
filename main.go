@@ -1,100 +1,117 @@
 package main
 
 import (
-	"./echonest"
+	"./spotify"
+	"./twealtime"
 	"./twitter"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 )
 
-var stats = make(map[string]int)
-
-func resolve(url string) {
-	resp, err := http.Head(url)
-	if err != nil {
-		fmt.Println("ERROR!!!", err.Error())
-		return
-	}
-	if resp.StatusCode != 200 {
-		return
-	}
-	url = resp.Request.URL.String()
-
-	p := strings.Split(url, "/")
-
-	// Skip links that cannot be to a specific resource
-	if len(p) < 4 || len(p[3]) == 0 {
+func getSpotifyUri(urlString string) (uri string) {
+	resp, err := http.Head(urlString)
+	if err != nil || resp.StatusCode != 200 {
 		return
 	}
 
-	stats[p[2]]++
-	//fmt.Printf("%#v\n", stats)
-
-	fmt.Println("URL:", url)
-	if strings.HasPrefix(url, "http://www.last.fm") {
-		pieces := strings.Split(url[19:], "/")
-		switch len(pieces) {
-		case 1:
-			fmt.Println("Artist:", pieces[0])
-		case 2:
-			fmt.Println("Album:", pieces[1], "by", pieces[0])
-		default:
-			fmt.Println("Track:", pieces[2], "by", pieces[0])
+	info, _ := url.Parse(resp.Request.URL.String())
+	if info.Host == "open.spotify.com" {
+		parts := strings.Split(info.Path, "/")
+		if len(parts) != 3 || parts[1] != "track" {
+			return
 		}
+		uri = "spotify:track:" + parts[2]
 	}
+
+	return
 }
 
 func main() {
-	matchNowPlaying := regexp.MustCompile(`(?:\A| )"?(\pL[\pL!'.-]*(?: \pL[\pL!'.-]*)*)"?\s*(?:'s|[♪–—~|:-]+|by)\s*"?(\pL[\pL!'.-]*(?: \pL[\pL!'.-]*)*)"?(?: |\z)`)
+	// Regexp that cleans up a tweet before scanning it for artist/track names.
 	cleanTweet := regexp.MustCompile(`\A(?i:now playing|listening to|escuchando a)|on (album|#)|del àlbum`)
+	// Regexp that finds artist/track names in a tweet.
+	matchNowPlaying := regexp.MustCompile(`(?:\A| )"?(\pL[\pL!'.-]*(?: \pL[\pL!'.()-]*)*)"?\s*(?:'s|[♪–—~|:/-]+|by)\s*"?(\pL[\pL!'.-]*(?: \pL[\pL!'.()-]*)*)"?(?:[ #]|\z)`)
 
-	en := echonest.GetApi("<echo nest key>")
+	// Create a Spotify API object for searching the Spotify catalog.
+	sp := spotify.GetApi()
 
-	// Get the Twitter Stream API
-	stream := &twitter.StreamApi{"username", "password"}
-	// Create a channel that will be receiving tweets
-	tweets := make(chan *twitter.Tweet)
-	// Start streaming tweets in a goroutine
-	go stream.StatusesFilter([]string{"#nowplaying", "open.spotify.com", "spoti.fi"}, tweets)
-	// Fetch tweets as they come in
+	// Create a web socket server that will be serving the data to other apps.
+	server := twealtime.NewServer()
+	go server.Serve(":1337")
+
+	// Get the Twitter Stream API.
+	twitterStream := &twitter.StreamApi{"username", "password"}
+	// Create a channel that will be receiving tweets.
+	tweets := make(chan *twitter.Tweet, 100)
+	// Start streaming tweets in a goroutine.
+	go twitterStream.StatusesFilter([]string{"#spotify", "#nowplaying", "open.spotify.com", "spoti.fi"}, tweets)
+	// Fetch tweets as they come in.
 	for tweet := range tweets {
-		fmt.Printf("@%s (%d followers)\n", tweet.User.Screen_name, tweet.User.Followers_count)
-		fmt.Println(tweet.Text)
 		cleaned := cleanTweet.ReplaceAllString(tweet.Text, "$")
-		if matches := matchNowPlaying.FindStringSubmatch(cleaned); matches != nil {
-			results := make(chan *echonest.SongSearchQuery)
-			go en.SongSearch(matches[1], matches[2], results)
-			go en.SongSearch(matches[2], matches[1], results)
 
-			artistResult := make(chan *echonest.ArtistExtractQuery)
-			go en.ArtistExtract(matches[1]+" "+matches[2], artistResult)
-			qry := <-artistResult
-			for _, artist := range qry.Response.Artists {
-				fmt.Println("=>", artist.Name)
+		// TODO: Make this nicer than an anonymous goroutine.
+		go func(tweet *twitter.Tweet) {
+			// First of all, try to find a Spotify URL directly in the tweet.
+			var uri string
+			for _, url := range tweet.Entities.Urls {
+				uri = getSpotifyUri(url.ExpandedUrl)
+				if uri != "" {
+					break
+				}
 			}
 
-			doOne := func(query *echonest.SongSearchQuery) {
-				fmt.Println("~~~~~")
-				fmt.Printf("title: %#v, artist: %#v\n", query.Title, query.Artist)
-				if query.Error != nil {
-					fmt.Println("FAILED:", query.Error.Error())
+			// Find artist and track name in the tweet.
+			matches := matchNowPlaying.FindStringSubmatch(cleaned)
+			// Only do this if we didn't find a URI already.
+			if uri == "" && matches != nil {
+				// Spotify search query format.
+				const format = `title:"%s" AND artist:"%s"`
+
+				// Create a channel for receiving results.
+				results := make(chan *spotify.SearchTrackQuery)
+				// Send off two simultaneous search requests to the Spotify search API, trying artist/track and the reverse
+				// (since we don't know if people wrote "Track - Artist" or "Artist - Track")
+				go sp.SearchTrack(fmt.Sprintf(format, matches[1], matches[2]), results)
+				go sp.SearchTrack(fmt.Sprintf(format, matches[2], matches[1]), results)
+				// Wait for the results to come in.
+				result1 := <-results
+				result2 := <-results
+
+				if result1.Error != nil || result2.Error != nil {
+					fmt.Println("!!", tweet.Text)
+					fmt.Println()
 					return
 				}
-				for _, song := range query.Response.Songs {
-					fmt.Println("-", song.Title, "by", song.Artist_name)
-					uri := strings.Replace(song.Tracks[0].Foreign_id, "-WW", "", 1)
-					fmt.Println("  =>", uri)
+
+				// Get the track of the result with the most results (which is most likely to be the correct one.)
+				if result1.Info.NumResults > result2.Info.NumResults {
+					uri = result1.Tracks[0].Href
+				} else if result2.Info.NumResults > result1.Info.NumResults {
+					uri = result2.Tracks[0].Href
 				}
 			}
 
-			doOne(<-results)
-			doOne(<-results)
-		}
-		for _, url := range tweet.Entities.Urls {
-			resolve(url.Expanded_url)
-		}
-		fmt.Println("----")
+			// No URI was found; don't do anything.
+			if uri == "" {
+				fmt.Println(":/", tweet.Text)
+				fmt.Println()
+				return
+			}
+
+			// Send tweet info and track URI through the web socket server.
+			fmt.Println("<<", tweet.Text)
+			fmt.Println(">>", uri)
+			fmt.Println()
+
+			server.Send(twealtime.TrackMention{
+				Tweet:            tweet.Text,
+				TwitterUser:      tweet.User.ScreenName,
+				TwitterFollowers: tweet.User.FollowersCount,
+				TrackUri:         uri,
+			})
+		}(tweet)
 	}
 }
